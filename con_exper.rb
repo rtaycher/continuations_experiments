@@ -1,49 +1,112 @@
-require 'continuation' 
+require 'continuation'
 
-except_stack = []
-
-class ReturnException < StandardError
-  def initialize(value)
-    @value = value
-  end    
+require 'pathname'
+CSI = "\e["
+def _code_to_chars(code)
+    "#{CSI}#{code}m"
 end
 
-# ReturnException taken from http://stackoverflow.com/a/1893309/259130
-module CatchReturnException
-  def catch_return_exception(func_name)   # This is the function that will DO the decoration: given a function, it'll extend it to have 'documentation' functionality.
-    new_name_for_old_function = "#{func_name}_old".to_sym   # We extend the old function by 'replacing' it - but to do that, we need to preserve the old one so we can still call it from the snazzy new function.
-    alias_method(new_name_for_old_function, func_name)  # This function, alias_method(), does what it says on the tin - allows us to call either function name to do the same thing.  So now we have TWO references to the OLD crappy function.  Note that alias_method is NOT a built-in function, but is a method of Class - that's one reason we're doing this from a module.
-    define_method(func_name) do |*args|   # Here we're writing a new method with the name func_name.  Yes, that means we're REPLACING the old method.
-      puts "about to call #{func_name}(#{args.join(', ')})"  # ... do whatever extended functionality you want here ...
-      begin
-          return send(new_name_for_old_function, *args)  # This is the same as `self.send`.  `self` here is an instance of your extended class.  As we had TWO references to the original method, we still have one left over, so we can call it here.
-      rescue  ReturnException => error
-           return error.value
-      end
+STYLE_BRIGHT = _code_to_chars(1)
+FORE_BLUE = _code_to_chars(34)
+STYLE_RESET_ALL = _code_to_chars(0)
+S = FORE_BLUE
+SR = STYLE_RESET_ALL
+def debug_print_here(expr=nil)
+    cl = caller_locations(1,1)[0]
+
+    filename = Pathname.new(cl.absolute_path).basename
+    puts "#{S}File: #{filename} Line: #{cl.lineno} Func: #{cl.label}#{SR}"
+    result = eval expr if expr
+    puts "#{S}Expr: #{expr} Type: #{result.class} Result: #{result}#{SR}" if expr    
+end
+def class_names(obj)
+    class_obj = obj.class
+    names = []
+    name =''
+    while class_obj and !(name == "StandardError")  do                
+        name = class_obj.name
+        names << name        
+        class_obj = class_obj.superclass
+ 
+   
     end
-  end
+    names
 end
-
-coroutine_exception_stack = []
+$coroutine_exception_stack = []
 class CoroutineExceptionHandling
-    def begin(&block)
-        @block = block
+    attr_reader :cc_to_begin, :rescue_continuations, :cc_to_ensure_block, :cc_to_go
+    attr_accessor :ex
+    def initialize
+        @cc_to_begin = nil
+        @rescue_continuations = {}
+        @cc_to_ensure = nil
+        @ensure_started = false
+        @cc_to_go = nil
+        @cc_ = nil
+        @started_finally = false
+        @started = false
+        @ex=nil
+        @ex_handled=false
     end
-    def self.raise_
+    def self.raise_(ex)
+        debug_print_here "$coroutine_exception_stack"
+        raise ex if $coroutine_exception_stack.empty?
+        last_handle_context = $coroutine_exception_stack.last
+        last_handle_context.ex = ex
+        name = ex.class.name
+        rescue_cc = last_handle_context.rescue_continuations.delete(name)
+        if rescue_cc
+            rescue_cc.call
+        end
+        if last_handle_context.cc_to_ensure_block
+            last_handle_context.cc_to_ensure_block.call
+        end
     end
-    def rescue_
-        call_result = Kernel.callcc{|cc| @continuation_to_coroutine=cc}
-        @skip = call_result == @cc_to_coroutine        
+    def begin_
+        Kernel.callcc{|cc| @cc_to_begin=cc}        
+        @started
+    end
+    def rescue_(ex_class=StandardError.new)
+        if @started
+            @cc_to_go.call
+        end        
+        class_names(ex_class).each do |name|
+            Kernel.callcc{|cc| @rescue_continuations[name]=cc}
+        end
+        
+        
+        if @started
+            @ex_handled = true
+        end
+        @started
     end
     def ensure_
-        call_result = Kernel.callcc{|cc| @continuation_to_coroutine=cc}
-        @skip = call_result == @cc_to_coroutine
+        if @started
+            @cc_to_go.call
+        end
+        Kernel.callcc{|cc| @cc_to_ensure=cc}
+        if @started
+           @ensure_started = true
+        end
+        @started
     end
-
     def go
-        coroutine_exception_stack << self
-        @block.call
-        
+        Kernel.callcc{|cc| @cc_to_go=cc}
+        if @started
+            if @cc_to_ensure and !@ensure_started                
+                @cc_to_ensure.call
+            end            
+            $coroutine_exception_stack.pop
+            if @ex && !@ex_handled
+                CoroutineExceptionHandling.raise_ @ex
+            end
+        else
+            @started = true
+            $coroutine_exception_stack << self
+            debug_print_here "$coroutine_exception_stack"
+            debug_print_here
+            @cc_to_begin.call            
+        end
     end
 end
 CEH = CoroutineExceptionHandling
@@ -112,16 +175,44 @@ class A
     #Scatch_return_exception(:a)
 end
 
-A.new.a.each {|x| puts x}
 
-#puts A.new.a.map{|v| v*3}.select{|v| v%2 != 0}
+def test_exceptions2
+    ctx = CEH.new
+    if ctx.begin_
+        puts "begin2"
+        CEH.raise_ RangeError.new('ex2')
+    end
+    if ctx.rescue_ IOError
+        puts "rescue2 IOError #{ctx.ex}"
+    end
+    if ctx.ensure_
+        puts "ensure2"
+    end 
+    ctx.go    
+end
 
 def test_exceptions
-    CEH.new.begin {|| 
-        puts "yo"
-    }.rescue_ {||
-        []
-    }.ensure_ {|| 
-    }.go
+    ctx = CEH.new
+    if ctx.begin_
+        puts "begin"
+        #test_exceptions2
+        CEH.raise_ TypeError.new('bob')
+    end
+    if ctx.rescue_
+        puts "rescue plain #{ctx.ex}"
+    end
+    if ctx.rescue_ TypeError
+        puts "rescue TypeError #{ctx.ex}"
+    end
+    if ctx.ensure_
+        puts "ensure"
+    end 
+    ctx.go
 end
+
+A.new.a.each {|x| puts x}
+puts A.new.a.map{|v| v*3}.select{|v| v%2 != 0}
+
 #test_exceptions
+
+#debug_print_here '$coroutine_exception_stack'
